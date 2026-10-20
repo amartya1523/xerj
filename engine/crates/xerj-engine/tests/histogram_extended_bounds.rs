@@ -26,6 +26,9 @@ use xerj_engine::bulk::process_bulk;
 use xerj_engine::Engine;
 use xerj_query::parse_request;
 
+/// One case: the histogram agg, the expected (key, doc_count) buckets, and a label.
+type HistogramCase = (Value, Vec<(i64, u64)>, &'static str);
+
 /// The #1819 reproduction's values. ES 8.13.4, `interval: 5`,
 /// `extended_bounds: {min: 0, max: 10}`:
 /// `-5:1, 0:2, 5:0, 10:1, 15:0, 20:0, 25:1`.
@@ -99,7 +102,7 @@ async fn extended_bounds_keeps_data_buckets_outside_the_bounds_on_both_executors
     build_index(&engine, "big", VALUES.len() * BIG_REPEAT).await;
 
     // (agg, expected buckets for ONE copy of VALUES, what the case pins)
-    let cases: Vec<(Value, Vec<(i64, u64)>, &str)> = vec![
+    let cases: Vec<HistogramCase> = vec![
         (
             json!({"histogram": {"field": "v", "interval": 5,
                                  "extended_bounds": {"min": 0, "max": 10}}}),

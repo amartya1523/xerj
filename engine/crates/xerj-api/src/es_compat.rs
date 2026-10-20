@@ -6099,9 +6099,22 @@ fn deserialize_non_negative_from<'de, D>(deserializer: D) -> Result<usize, D::Er
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error as _;
-    let n = i64::deserialize(deserializer)?;
-    usize::try_from(n).map_err(|_| D::Error::custom(negative_from_reason(n)))
+    struct FromVisitor;
+    impl serde::de::Visitor<'_> for FromVisitor {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer")
+        }
+        fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<usize, E> {
+            usize::try_from(n).map_err(|_| E::custom(negative_from_reason(n)))
+        }
+        // A huge positive `from` (e.g. u64::MAX) must reach the result-window
+        // check rather than fail as a JSON type error.
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<usize, E> {
+            Ok(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+    }
+    deserializer.deserialize_any(FromVisitor)
 }
 
 fn negative_from_reason(n: i64) -> String {

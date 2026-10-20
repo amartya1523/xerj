@@ -28033,6 +28033,15 @@ impl Index {
                 (None, None) => (f64::INFINITY, true),
             };
             let field_str = field.as_str();
+            // #1750 — the memtable numeric column keeps only an array's
+            // first element, so `for_each_numeric_value` below would count a
+            // multi-valued doc by that element alone. Abandon to the counting
+            // scan, whose matcher checks every element. (Segments already
+            // abandon: a field that is an array anywhere in a segment gets no
+            // dv column, which is the `None` arm below.)
+            if self.memtable.range_column_unusable(field_str) {
+                return None;
+            }
 
             let segments_dir = self.data_dir.join("segments");
             let mut seg_matches: u64 = 0;
@@ -36464,7 +36473,9 @@ fn apply_highlight(hits: Vec<Hit>, hl: &HighlightRequest, query: &QueryNode) -> 
                     // so matches can be translated back to original-text char
                     // boundaries (fixes the multibyte highlight SIGABRT).
                     let (text_lower, lower_map) = build_lower_offset_map(&text);
-                    let has_any = query_terms.iter().any(|t| text_lower.contains(t.as_str()));
+                    let has_any = query_terms
+                        .iter()
+                        .any(|t| next_term_match(&text_lower, t, 0).is_some());
                     if !has_any {
                         continue;
                     }
@@ -36650,14 +36661,29 @@ fn collect_highlight_terms(query: &QueryNode, out: &mut Vec<String>) {
     match query {
         QueryNode::Match { query, .. }
         | QueryNode::MatchPhrase { query, .. }
-        | QueryNode::MultiMatch { query, .. }
-        | QueryNode::QueryString { query, .. } => {
+        | QueryNode::MultiMatch { query, .. } => {
             for tok in query.split_whitespace() {
                 let tok = tok
                     .trim_matches(|c: char| !c.is_alphanumeric())
                     .to_lowercase();
                 if !tok.is_empty() {
                     out.push(tok);
+                }
+            }
+        }
+        QueryNode::QueryString { query, .. } => {
+            for tok in query.split_whitespace() {
+                // `wild*` keeps its star so it highlights `wildcard` as a
+                // prefix match; every other term matches whole words only.
+                let prefix = tok
+                    .trim_start_matches(|c: char| !c.is_alphanumeric())
+                    .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '*')
+                    .ends_with('*');
+                let tok = tok
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
+                if !tok.is_empty() {
+                    out.push(if prefix { format!("{tok}*") } else { tok });
                 }
             }
         }
@@ -36683,6 +36709,112 @@ fn collect_highlight_terms(query: &QueryNode, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// A character that continues a word, for highlight boundaries.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The next occurrence of highlight `term` in `text_lower` at or after byte
+/// `from` that stands as a whole word: the characters on either side are not
+/// word characters. A term ending in `*` (a `query_string` prefix) needs a
+/// boundary before it only and extends to the end of the word it starts.
+///
+/// Plain substring search (#1948) highlighted `or` inside `for`, `no` inside `not`
+/// and `OR` inside `SECTOR`, and a phrase's short words then claimed the
+/// fragment away from the phrase itself.
+fn next_term_match(text_lower: &str, term: &str, from: usize) -> Option<(usize, usize)> {
+    let (needle, prefix) = match term.strip_suffix('*') {
+        Some(stem) => (stem, true),
+        None => (term, false),
+    };
+    if needle.is_empty() || from > text_lower.len() {
+        return None;
+    }
+    let mut start = from;
+    while let Some(pos) = text_lower[start..].find(needle) {
+        let abs = start + pos;
+        let mut end = abs + needle.len();
+        let before_ok = !text_lower[..abs]
+            .chars()
+            .next_back()
+            .is_some_and(is_word_char);
+        if prefix {
+            end += text_lower[end..]
+                .char_indices()
+                .find(|&(_, c)| !is_word_char(c))
+                .map(|(i, _)| i)
+                .unwrap_or(text_lower.len() - end);
+        }
+        let after_ok = prefix || !text_lower[end..].chars().next().is_some_and(is_word_char);
+        if before_ok && after_ok {
+            return Some((abs, end));
+        }
+        // Step one character, not one byte, past this candidate.
+        start = abs + text_lower[abs..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// Wrap every whole-word occurrence of every term inside `text[win_start..
+/// win_end]` with `pre`/`post`. Overlapping spans merge into one tag pair.
+#[allow(clippy::too_many_arguments)]
+fn tag_terms_in_window(
+    text: &str,
+    text_lower: &str,
+    lower_map: &[(usize, usize, usize)],
+    terms: &[String],
+    win_start: usize,
+    win_end: usize,
+    pre: &str,
+    post: &str,
+) -> String {
+    let orig_len = text.len();
+    // Start the scan at the window, not at the top of a large document.
+    let window_lower_start = lower_map
+        .get(lower_map.partition_point(|e| e.1 < win_start))
+        .map_or(text_lower.len(), |e| e.0);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for term in terms {
+        let mut from = window_lower_start;
+        while let Some((ls, le)) = next_term_match(text_lower, term, from) {
+            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, ls, le);
+            if oa >= win_end {
+                break;
+            }
+            if oa >= win_start && ob <= win_end && ob > oa {
+                spans.push((oa, ob));
+            }
+            from = le.max(ls + 1);
+        }
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(win_end - win_start + spans.len() * 9);
+    let mut cursor = win_start;
+    let mut open: Option<(usize, usize)> = None;
+    let flush = |out: &mut String, cursor: &mut usize, (s, e): (usize, usize)| {
+        out.push_str(&text[*cursor..s]);
+        out.push_str(pre);
+        out.push_str(&text[s..e]);
+        out.push_str(post);
+        *cursor = e;
+    };
+    for (s, e) in spans {
+        match open {
+            Some((os, oe)) if s <= oe => open = Some((os, oe.max(e))),
+            Some(span) => {
+                flush(&mut out, &mut cursor, span);
+                open = Some((s, e));
+            }
+            None => open = Some((s, e)),
+        }
+    }
+    if let Some(span) = open {
+        flush(&mut out, &mut cursor, span);
+    }
+    out.push_str(&text[cursor..win_end]);
+    out
 }
 
 /// Build highlighted fragments for a single field value.
@@ -36764,15 +36896,14 @@ fn highlight_full_text(
             continue;
         }
         let mut start = 0;
-        while let Some(pos) = text_lower[start..].find(term.as_str()) {
-            let abs = start + pos;
+        while let Some((ls, le)) = next_term_match(text_lower, term, start) {
             // Translate the lowercased-text match offsets back to original
             // text char boundaries before recording the span.
-            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, abs, abs + term.len());
+            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, ls, le);
             if ob > oa {
                 spans.push((oa, ob));
             }
-            start = abs + term.len();
+            start = le.max(ls + 1);
         }
     }
     spans.sort_by_key(|&(s, _)| s);
@@ -36838,14 +36969,13 @@ fn build_highlight_fragments(
         // highlighting and downloaded whole documents instead.
         let mut per_term = 0usize;
         let per_term_cap = (num_frags * 4).max(4);
-        while let Some(pos) = text_lower[start..].find(term.as_str()) {
-            let abs = start + pos;
-            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, abs, abs + term.len());
+        while let Some((ls, le)) = next_term_match(text_lower, term, start) {
+            let (oa, ob) = lower_span_to_orig(lower_map, orig_len, ls, le);
             if ob > oa {
                 match_positions.push((oa, ob));
-                lower_positions.push((abs, abs + term.len()));
+                lower_positions.push((ls, le));
             }
-            start = abs + term.len();
+            start = le.max(ls + 1);
             per_term += 1;
             if per_term >= per_term_cap {
                 break; // enough candidates FOR THIS TERM; keep scanning others
@@ -36883,7 +37013,10 @@ fn build_highlight_fragments(
                 .find(|&i| text_lower.is_char_boundary(i))
                 .unwrap_or(lower_len);
             let window = &text_lower[lo..hi];
-            let distinct = terms.iter().filter(|t| window.contains(t.as_str())).count();
+            let distinct = terms
+                .iter()
+                .filter(|t| next_term_match(window, t, 0).is_some())
+                .count();
             (distinct, orig)
         })
         .collect();
@@ -36919,7 +37052,7 @@ fn build_highlight_fragments(
     let mut fragments: Vec<String> = Vec::new();
     let mut last_win_end: usize = 0;
 
-    for (byte_start, byte_end) in &match_positions {
+    for (byte_start, _) in &match_positions {
         if fragments.len() >= num_frags {
             break;
         }
@@ -36941,28 +37074,16 @@ fn build_highlight_fragments(
         }
         last_win_end = win_end;
 
-        // Clamp match offsets to the window.
-        let match_start = (*byte_start).max(win_start).min(win_end);
-        let match_end = (*byte_end).max(win_start).min(win_end);
-
-        // Build the fragment: prefix + pre-tag + matched span + post-tag + suffix.
+        // Build the fragment: every query term inside the window is tagged,
+        // not only the match the window is centred on, so a phrase reads as
+        // its words tagged in place (original casing kept).
         let mut frag = String::with_capacity(frag_size + pre.len() + post.len() + 6);
         if win_start > 0 {
             frag.push_str("...");
         }
-        // Text before the match (within the window).
-        if match_start > win_start {
-            // Use the original text casing for the context surrounding the match.
-            frag.push_str(&text[win_start..match_start]);
-        }
-        frag.push_str(pre);
-        // The matched span (from original text, not lowercased).
-        frag.push_str(&text[match_start..match_end]);
-        frag.push_str(post);
-        // Text after the match (within the window).
-        if match_end < win_end {
-            frag.push_str(&text[match_end..win_end]);
-        }
+        frag.push_str(&tag_terms_in_window(
+            text, text_lower, lower_map, terms, win_start, win_end, pre, post,
+        ));
         if win_end < total_bytes {
             frag.push_str("...");
         }
@@ -46014,69 +46135,12 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             lte,
             lt,
             ..
-        } => {
-            let doc_val = get_field_value(source, field);
-            match doc_val {
-                Some(dv) => {
-                    // Check if we're comparing IP addresses.
-                    let doc_is_ip = dv
-                        .as_str()
-                        .map(|s| parse_ip_to_u128(s).is_some())
-                        .unwrap_or(false);
-                    let bound_is_ip = gte
-                        .as_ref()
-                        .or(gt.as_ref())
-                        .or(lte.as_ref())
-                        .or(lt.as_ref())
-                        .and_then(|b| b.as_str())
-                        .map(|s| parse_ip_to_u128(s).is_some())
-                        .unwrap_or(false);
-
-                    if doc_is_ip && bound_is_ip {
-                        // IP address comparison using numeric ordering.
-                        let doc_ip = parse_ip_to_u128(dv.as_str().unwrap_or("")).unwrap_or(0);
-                        let passes_lower = match (gte, gt) {
-                            (Some(b), _) => {
-                                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
-                                doc_ip >= bound
-                            }
-                            (None, Some(b)) => {
-                                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
-                                doc_ip > bound
-                            }
-                            (None, None) => true,
-                        };
-                        let passes_upper = match (lte, lt) {
-                            (Some(b), _) => {
-                                let bound =
-                                    b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
-                                doc_ip <= bound
-                            }
-                            (None, Some(b)) => {
-                                let bound =
-                                    b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
-                                doc_ip < bound
-                            }
-                            (None, None) => true,
-                        };
-                        passes_lower && passes_upper
-                    } else {
-                        let passes_lower = match (gte, gt) {
-                            (Some(b), _) => json_compare(&dv, b) >= 0,
-                            (None, Some(b)) => json_compare(&dv, b) > 0,
-                            (None, None) => true,
-                        };
-                        let passes_upper = match (lte, lt) {
-                            (Some(b), _) => json_compare(&dv, b) <= 0,
-                            (None, Some(b)) => json_compare(&dv, b) < 0,
-                            (None, None) => true,
-                        };
-                        passes_lower && passes_upper
-                    }
-                }
-                None => false,
+        } => match get_field_value(source, field) {
+            Some(dv) => {
+                range_value_matches(&dv, gte.as_ref(), gt.as_ref(), lte.as_ref(), lt.as_ref())
             }
-        }
+            None => false,
+        },
 
         QueryNode::Exists { field } => match field.as_str() {
             "_id" | "_index" | "_seq_no" | "_version" | "_primary_term" => true,
@@ -50404,6 +50468,85 @@ fn compute_sort_values(
         sort_vals.push(v);
     }
     sort_vals
+}
+
+/// `_source` matcher for one `range` clause against a field value.
+///
+/// #1750 — a multi-valued field matches when ANY single element satisfies
+/// EVERY bound, which is Lucene's per-value point semantics and what ES 8.13
+/// returns. Comparing the array itself sent `json_compare` to its serialized
+/// text (`["alpha","mid"]`, `[22,8080]`), and because `'['` sorts after every
+/// digit and before every lowercase letter, an array passed any numeric/date
+/// lower bound, failed any upper bound, and failed a keyword `gte "m"` —
+/// whatever its elements were. The bounds are deliberately NOT split across
+/// elements: `["2020-01-01","2024-06-01"]` is outside
+/// `[2021-01-01, 2023-01-01)` even though one element clears each bound.
+/// Nested arrays flatten (ES indexes `[[1,2],3]` as three values) and `null`
+/// elements are skipped, as ES does not index them.
+fn range_value_matches(
+    dv: &Value,
+    gte: Option<&Value>,
+    gt: Option<&Value>,
+    lte: Option<&Value>,
+    lt: Option<&Value>,
+) -> bool {
+    if let Value::Array(arr) = dv {
+        return arr
+            .iter()
+            .any(|elem| !elem.is_null() && range_value_matches(elem, gte, gt, lte, lt));
+    }
+    // Check if we're comparing IP addresses.
+    let doc_is_ip = dv
+        .as_str()
+        .map(|s| parse_ip_to_u128(s).is_some())
+        .unwrap_or(false);
+    let bound_is_ip = gte
+        .or(gt)
+        .or(lte)
+        .or(lt)
+        .and_then(|b| b.as_str())
+        .map(|s| parse_ip_to_u128(s).is_some())
+        .unwrap_or(false);
+
+    if doc_is_ip && bound_is_ip {
+        // IP address comparison using numeric ordering.
+        let doc_ip = parse_ip_to_u128(dv.as_str().unwrap_or("")).unwrap_or(0);
+        let passes_lower = match (gte, gt) {
+            (Some(b), _) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
+                doc_ip >= bound
+            }
+            (None, Some(b)) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(0);
+                doc_ip > bound
+            }
+            (None, None) => true,
+        };
+        let passes_upper = match (lte, lt) {
+            (Some(b), _) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
+                doc_ip <= bound
+            }
+            (None, Some(b)) => {
+                let bound = b.as_str().and_then(parse_ip_to_u128).unwrap_or(u128::MAX);
+                doc_ip < bound
+            }
+            (None, None) => true,
+        };
+        passes_lower && passes_upper
+    } else {
+        let passes_lower = match (gte, gt) {
+            (Some(b), _) => json_compare(dv, b) >= 0,
+            (None, Some(b)) => json_compare(dv, b) > 0,
+            (None, None) => true,
+        };
+        let passes_upper = match (lte, lt) {
+            (Some(b), _) => json_compare(dv, b) <= 0,
+            (None, Some(b)) => json_compare(dv, b) < 0,
+            (None, None) => true,
+        };
+        passes_lower && passes_upper
+    }
 }
 
 pub(crate) fn get_field_value(source: &Value, field: &str) -> Option<Value> {
@@ -56620,6 +56763,45 @@ mod highlight_multibyte_tests {
             "the rare term is what the caller searched for; fragments must reach \
              it rather than returning the head of the document: {frags:?}"
         );
+    }
+
+    /// #1948: a phrase query highlighted `or` inside `for` and `no` inside
+    /// `not`, and only the one match each fragment was centred on, so the
+    /// phrase itself came back untagged.
+    #[test]
+    fn highlight_tags_whole_words_and_every_term_in_the_fragment() {
+        let text = "Pricing is per-node for Professional, custom for Enterprise. \
+                    No per-doc, per-vector, or per-query fees. Binary delivery \
+                    does not require a sector license.";
+        let (lower, map) = build_lower_offset_map(text);
+        let mut terms: Vec<String> = ["no", "per-doc", "per-vector", "or", "per-query", "fees"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        terms.sort();
+        let frags = build_highlight_fragments(text, &lower, &map, &terms, "<em>", "</em>", 150, 1);
+        assert_eq!(frags.len(), 1, "{frags:?}");
+        let f = &frags[0];
+        assert!(
+            f.contains("<em>No</em> <em>per-doc</em>, <em>per-vector</em>, <em>or</em> <em>per-query</em> <em>fees</em>"),
+            "every phrase word is tagged in place: {f}"
+        );
+        assert!(!f.contains("f<em>or</em>"), "no match inside `for`: {f}");
+        assert!(!f.contains("<em>no</em>t"), "no match inside `not`: {f}");
+
+        let full = highlight_full_text(text, &lower, &map, &terms, "<em>", "</em>");
+        assert!(
+            !full.contains("f<em>or</em>") && !full.contains("<em>no</em>t"),
+            "{full}"
+        );
+        assert!(!full.contains("sect<em>or</em>"), "{full}");
+
+        // A `query_string` prefix term still reaches into the word.
+        let (lower, map) = build_lower_offset_map("a wildcard and wild cats");
+        let prefix = vec!["wild*".to_string()];
+        let full = highlight_full_text("a wildcard and wild cats", &lower, &map, &prefix, "[", "]");
+        assert_eq!(full, "a [wildcard] and [wild] cats");
+        assert_eq!(next_term_match("rewild", "wild*", 0), None);
     }
 
     #[test]

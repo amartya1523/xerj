@@ -107,7 +107,8 @@ pub fn hub_key_configured() -> bool {
 pub const NO_HUB_KEY_MESSAGE: &str = "Corpus Hub packs are not available in this build: it has \
      no hub signing key, so no catalogue or pack can be verified and nothing was downloaded. \
      For reference code, index the projects yourself with `xerj corpus add` and search them \
-     with `xerj code` (see `xerj code --help`).";
+     with `xerj code` (see `xerj code --help`). A folder you indexed with `xerj autoindex` \
+     is queried with `xerj search` or `xerj def`, not `xerj ask`.";
 
 /// What a per-source licence review allows, straight from the registry's
 /// `review.use`. Governs whether a pack is pulled silently, with a warning, or
@@ -401,6 +402,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn a_build_without_a_hub_key_points_ask_at_local_search() {
+        assert!(NO_HUB_KEY_MESSAGE.contains("`xerj search`"));
+        assert!(NO_HUB_KEY_MESSAGE.contains("`xerj def`"));
+        assert!(NO_HUB_KEY_MESSAGE.contains("`xerj autoindex`"));
+        assert!(NO_HUB_KEY_MESSAGE.contains("not `xerj ask`"));
+        assert!(!NO_HUB_KEY_MESSAGE.contains("xerj hub sync"));
+    }
+
+    #[test]
     fn the_compiled_in_hub_key_is_32_bytes_of_lower_hex() {
         // The workflows read it with a `[0-9a-fA-F]*` sed and compare lower-case;
         // ed25519.sh and verify_bytes both want exactly 64 hex characters.
@@ -419,7 +429,10 @@ mod tests {
         // sed over this file. If a reformat ever wrapped the declaration, they
         // would read "" and go quietly dormant instead of publishing.
         let line = format!("\npub const HUB_PUBKEY_HEX: &str = \"{HUB_PUBKEY_HEX}\";\n");
-        assert!(include_str!("hub.rs").contains(&line), "{line}");
+        assert!(
+            include_str!("hub.rs").replace("\r\n", "\n").contains(&line),
+            "{line}"
+        );
     }
 
     #[test]

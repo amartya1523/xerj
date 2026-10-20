@@ -156,7 +156,20 @@ pub fn next_hint(
 }
 
 fn with_field_report(hint: String) -> String {
-    format!("{hint}\n{}", xerj_common::feedback::AUTO_SEND_LINE)
+    with_field_report_if(hint, xerj_common::feedback::enabled())
+}
+
+/// The footer honours the same opt-out as every other surface
+/// (`--disable-feedback` anywhere on the command line, or
+/// `XERJ_DISABLE_FEEDBACK=true`). It used not to, so `xerj corpus index`, which
+/// prints this footer from the autoindex run it drives, kept inviting a field
+/// report after the operator had switched the invitation off (issue #1903).
+fn with_field_report_if(hint: String, enabled: bool) -> String {
+    if enabled {
+        format!("{hint}\n{}", xerj_common::feedback::AUTO_SEND_LINE)
+    } else {
+        hint
+    }
 }
 
 /// The code-aware search hint that follows `next_hint` whenever source code
@@ -1387,6 +1400,50 @@ fn generated_exit_code(summary: &Value) -> i32 {
     }
 }
 
+/// The FIRST line of a finished run's human summary on stdout (#1843).
+///
+/// Exit 3 is success, but an agent that sees a non-zero exit reads failure
+/// unless something it reads first says otherwise. The `xerj-done` line on
+/// stderr already carries `ok=true`, yet it is the LAST line of a long progress
+/// stream and the summary on stdout opened with a timing line that never
+/// mentioned the exit code at all. So every finished run now leads with one
+/// line that starts `ok:` and names the exit code in words; exit 3 also says
+/// what was recorded and where to look, so junk stays visible.
+pub(crate) fn outcome_headline(
+    code: i32,
+    junk_files: u64,
+    junk_records: u64,
+    alias_sweep_failed: bool,
+) -> String {
+    if code != 3 {
+        return format!("ok: indexed and searchable (exit {code}, completed)");
+    }
+    if alias_sweep_failed {
+        return format!(
+            "ok: indexed and searchable — exit 3 ({ALIAS_SWEEP_FAILED_REASON}) is SUCCESS, not \
+             an error: the corpus is indexed and the journal committed; only the catalog's \
+             duplicate-alias cleanup could not run, so rerun the same command once the server \
+             condition clears"
+        );
+    }
+    let mut recorded = Vec::new();
+    if junk_files > 0 {
+        recorded.push(estimate::count_phrase(junk_files, "file", "files"));
+    }
+    if junk_records > 0 {
+        recorded.push(estimate::count_phrase(junk_records, "record", "records"));
+    }
+    let recorded = if recorded.is_empty() {
+        "some input".to_string()
+    } else {
+        recorded.join(" and ")
+    };
+    format!(
+        "ok: indexed and searchable — exit 3 (completed-with-junk) is SUCCESS, not an error: \
+         {recorded} recorded as junk (skipped, never fatal; `xerj autoindex map` lists them)"
+    )
+}
+
 /// Terminal progress line for a run that ends on the generated `--no-graph`
 /// path.
 ///
@@ -2040,6 +2097,40 @@ impl Drop for SampleLimitOverride {
 /// which every test owns as its own tempdir — makes it unstealable instead.
 #[cfg(test)]
 static REPLACEMENT_FAILPOINT: Mutex<Option<(u8, std::path::PathBuf)>> = Mutex::new(None);
+
+/// A test-only action run once when phase B starts, for the run that uses the
+/// given state directory: the window between phase A's digest and phase B's
+/// read, where a live file (a lock file, a log) changes under the run (#1911).
+/// Keyed on the state directory for the same reason as
+/// [`REPLACEMENT_FAILPOINT`].
+#[cfg(test)]
+type PhaseBStartHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static PHASE_B_START_HOOK: Mutex<Option<PhaseBStartHook>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_phase_b_start_hook(state_dir: &Path, action: impl FnOnce() + Send + 'static) {
+    *PHASE_B_START_HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((state_dir.to_path_buf(), Box::new(action)));
+}
+
+#[cfg(test)]
+fn phase_b_start_hook(state_dir: &Path) {
+    let action = {
+        let mut armed = PHASE_B_START_HOOK.lock().unwrap_or_else(|p| p.into_inner());
+        match armed.as_ref() {
+            Some((dir, _)) if dir == state_dir => armed.take().map(|(_, action)| action),
+            _ => None,
+        }
+    };
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn phase_b_start_hook(_state_dir: &Path) {}
 
 /// Arm [`replacement_failpoint`] for the run that uses `state_dir`, once.
 #[cfg(test)]
@@ -3119,6 +3210,7 @@ mod phase_a_grouping_tests {
             snapshot_max_bytes: 64 << 30,
             prefix: "t".into(),
             replace_prefix: false,
+            prefix_note: None,
             state_dir: None,
             fresh: true,
             follow_symlinks: false,
@@ -5038,6 +5130,16 @@ fn finish_generated_run(es: &Es, journal: &mut state::Journal, cfg: &IndexCfg) -
     if cfg.json {
         println!("{summary}");
     } else if !cfg.quiet {
+        let count = |field: &str| summary.get(field).and_then(Value::as_u64).unwrap_or(0);
+        println!(
+            "{}",
+            outcome_headline(
+                generated_exit_code(&summary),
+                count("files_junk"),
+                count("junk_records_total"),
+                false,
+            )
+        );
         println!(
             "generation {} committed — {}, {} live",
             generation,
@@ -6036,6 +6138,11 @@ fn run_index_report_inner(
     // any endpoint I/O below, and mirrored into the --json result. map/status
     // deliver the same note; they have no progress surface, so they `eprintln`.
     if let Some(note) = &cfg.xerj_url_note {
+        pr.warn(&format!("autoindex: {note}"));
+    }
+    // #1845: a rewritten --prefix is said out loud, next to the other
+    // "this run is not quite what you typed" warning.
+    if let Some(note) = &cfg.prefix_note {
         pr.warn(&format!("autoindex: {note}"));
     }
     // One throughput meter for the whole run: both phase-A routes (the legacy
@@ -7838,6 +7945,7 @@ fn run_index_report_inner(
         "phase B: indexing {} files with {} workers → {}",
         n_todo, cfg.workers, cfg.url
     ));
+    phase_b_start_hook(&state_dir);
     if n_pdf_spools > 0 {
         pr.note(&format!(
             "phase B: reusing {n_pdf_spools} run-local PDF extraction(s); these PDFs will not be \
@@ -7980,11 +8088,17 @@ fn run_index_report_inner(
                     continue;
                 }
             };
+            // #1911: a file that changed since phase A hashed it (a lock
+            // file, a log, a sqlite -wal) is ONE skipped file, not a reason
+            // to abort every other file's run. Nothing of it is staged yet.
             if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                let mut errors = bulk_errors.lock().unwrap();
-                if errors.len() < 5 {
-                    errors.push(format!("{error:#}"));
-                }
+                extra_junk.lock().unwrap().push(changed_during_run_junk(
+                    key,
+                    &f.rel,
+                    &format_str(Some(&sn)),
+                    f.size,
+                    &error,
+                ));
                 continue;
             }
             // File-card anchor node (§6.6.2a): one card doc per corpus
@@ -8320,10 +8434,18 @@ fn run_index_report_inner(
                 }
             }
             if send_err.is_none() {
+                // #1911: changed while it was being extracted. Its records are
+                // only staged locally (visibility starts below), so skipping it
+                // here leaves nothing of it on the node from this run.
                 if let Err(error) = content::verify(&f.path, f.size, expected_digest) {
-                    send_err = Some(format!(
-                        "{error:#}; no records from this changing file were made visible"
+                    extra_junk.lock().unwrap().push(changed_during_run_junk(
+                        key,
+                        &f.rel,
+                        &format_str(Some(&sn)),
+                        f.size,
+                        &error,
                     ));
+                    continue;
                 }
             }
             // Visibility begins only after extraction and the second
@@ -9418,11 +9540,36 @@ fn run_index_report_inner(
 
     // ── summary ──────────────────────────────────────────────────────────
     let junk_total_records = junk_records.load(Ordering::Relaxed);
+    // Exit 3 means "completed, some input was unusable". Backend rejections
+    // are not consulted and must not be: a rejected item aborts the run with
+    // an error long before this line, so `rejected_records` is provably 0
+    // here. Splitting them out of `junk_total_records` therefore changes no
+    // exit code.
+    //
+    // A failed alias sweep lands here too, and on 3 rather than on a code of
+    // its own: 3 already means "completed, and something about this run is
+    // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
+    // success code would break every caller that already branches on 0/3. The
+    // `reason` is what tells the two apart.
+    let code = if junk_total_records > 0 || junk_file_count > 0 || alias_sweep_error.is_some() {
+        3
+    } else {
+        0
+    };
     if cfg.json {
         println!("{run_doc}");
     } else if !cfg.quiet {
         println!(
-            "\n{}",
+            "{}",
+            outcome_headline(
+                code,
+                junk_file_count as u64,
+                junk_total_records,
+                alias_sweep_error.is_some(),
+            )
+        );
+        println!(
+            "{}",
             estimate::done_summary_line(
                 wall,
                 plan.datasets.len() as u64,
@@ -9515,22 +9662,6 @@ fn run_index_report_inner(
             println!("{}", mixed_corpus_hint(&fams));
         }
     }
-    // Exit 3 means "completed, some input was unusable". Backend rejections
-    // are not consulted and must not be: a rejected item aborts the run with
-    // an error long before this line, so `rejected_records` is provably 0
-    // here. Splitting them out of `junk_total_records` therefore changes no
-    // exit code.
-    //
-    // A failed alias sweep lands here too, and on 3 rather than on a code of
-    // its own: 3 already means "completed, and something about this run is
-    // recorded rather than fatal" (`cli.rs` EXIT CODES), and inventing a fourth
-    // success code would break every caller that already branches on 0/3. The
-    // `reason` is what tells the two apart.
-    let code = if junk_total_records > 0 || junk_file_count > 0 || alias_sweep_error.is_some() {
-        3
-    } else {
-        0
-    };
     // Terminal line, in every progress mode but `none` (which `--quiet`
     // selects, and which prints nothing by definition). Exit 3 means
     // "completed, some files were unparseable" — success — and an agent reading
@@ -9593,6 +9724,35 @@ fn run_index_report_inner(
     );
     drop(ticker);
     Ok((code, Some(run_doc)))
+}
+
+/// The catalog entry for a source file that changed between phase A's digest
+/// and phase B's read (#1911).
+///
+/// That used to land in `bulk_errors`, which aborts the whole run after phase B:
+/// one live lock file on Windows stopped a 1,894-file run at ~258 s and left
+/// its partial indices and journal for hand cleanup — and every retry met the
+/// same still-changing file. It is now one `skipped` file with the reason, the
+/// run finishes (exit 3, like any other skipped file), and because the file is
+/// never journaled done, the next run picks up whatever it then holds.
+fn changed_during_run_junk(
+    file_key: &str,
+    rel: &str,
+    format: &str,
+    bytes: u64,
+    error: &anyhow::Error,
+) -> JunkFile {
+    JunkFile {
+        file_key: file_key.to_string(),
+        rel: rel.to_string(),
+        format: format.to_string(),
+        status: "skipped".into(),
+        reason: format!(
+            "changed while this run was reading it, so it was skipped and nothing from it was \
+             made visible ({error:#}); rerun to index its current content"
+        ),
+        bytes,
+    }
 }
 
 fn format_str(sn: Option<&Sniffed>) -> String {
@@ -11252,6 +11412,23 @@ mod map_metadata_tests {
 mod generation_contract_identity_tests {
     use super::*;
 
+    #[test]
+    fn field_report_footer_honours_the_opt_out() {
+        // issue #1903: `xerj corpus index` printed it under XERJ_DISABLE_FEEDBACK=true
+        let on = with_field_report_if("next: x".to_string(), true);
+        assert!(on.contains(xerj_common::feedback::AUTO_SEND_LINE), "{on}");
+        let off = with_field_report_if("next: x".to_string(), false);
+        assert_eq!(off, "next: x");
+        assert!(!xerj_common::feedback::enabled_from(
+            ["xerj", "corpus", "index", "lz4", "--disable-feedback"],
+            None
+        ));
+        assert!(!xerj_common::feedback::enabled_from(
+            ["xerj", "corpus", "index", "lz4"],
+            Some("true".to_string())
+        ));
+    }
+
     fn dataset(slug: &str, index: &str, family: &str) -> PlanDataset {
         PlanDataset {
             slug: slug.into(),
@@ -11452,6 +11629,35 @@ mod generation_contract_identity_tests {
             !code.contains("curl"),
             "the code hint must not send the reader to a raw search, got: {code}"
         );
+    }
+
+    /// #1843: exit 3 read as failure because nothing an agent reads FIRST
+    /// said otherwise. Every finished run's stdout summary now opens with an
+    /// `ok:` line that names the exit code in words, and an exit-3 line says
+    /// what was recorded instead of hiding it.
+    #[test]
+    fn a_finished_run_leads_with_an_ok_line_that_spells_out_exit_3() {
+        let clean = outcome_headline(0, 0, 0, false);
+        assert!(clean.starts_with("ok: indexed and searchable"), "{clean}");
+        assert!(clean.contains("exit 0"), "{clean}");
+
+        let junk = outcome_headline(3, 1, 0, false);
+        assert!(junk.starts_with("ok: indexed and searchable"), "{junk}");
+        assert!(
+            junk.contains("exit 3 (completed-with-junk) is SUCCESS, not an error"),
+            "{junk}"
+        );
+        assert!(junk.contains("1 file recorded as junk"), "{junk}");
+        assert!(junk.contains("xerj autoindex"), "{junk}");
+        assert!(!junk.contains('\n'), "one line: {junk}");
+
+        let both = outcome_headline(3, 2, 5, false);
+        assert!(both.contains("2 files and 5 records"), "{both}");
+
+        let sweep = outcome_headline(3, 4, 0, true);
+        assert!(sweep.starts_with("ok: indexed and searchable"), "{sweep}");
+        assert!(sweep.contains(ALIAS_SWEEP_FAILED_REASON), "{sweep}");
+        assert!(sweep.contains("rerun the same command"), "{sweep}");
     }
 
     /// Resume of an already-indexed tokio tree printed

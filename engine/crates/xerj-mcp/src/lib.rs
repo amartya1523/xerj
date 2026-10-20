@@ -1171,7 +1171,7 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
                  need to ask the user first. Set confirm to false to get the draft back \
                  without posting. \
                  Honesty: this does not talk to the local XERJ node and does not send the \
-                 node's Authorization header. The endpoint caps verdict at 80 characters; \
+                 node's Authorization header. The endpoint caps verdict at 1000 characters; \
                  put the long report in notes. {}",
                 xerj_common::feedback::AUTO_SEND_LINE
             ),
@@ -1499,7 +1499,7 @@ fn field_report_draft(payload: &xerj_common::field_report::Payload) -> String {
          os: {os}\n\
          indexed: {indexed}\n\
          notes: {notes}\n\
-         HTTP body (verdict is capped at 80 characters; the long text is in notes):\n\
+         HTTP body (verdict is capped at 1000 characters; the long text is in notes):\n\
          {body}",
         agent = payload.agent,
         used_for = payload.used_for,
@@ -1896,18 +1896,25 @@ fn build_search(args: &Value) -> Result<BuiltRequest, String> {
         Some(Value::String(q)) if !q.trim().is_empty() => {
             plain_string = true;
             let shaped = xerj_common::code_query::normalize_code_search_query(q);
-            body.insert(
-                "query".into(),
-                json!({ "bool": { "should": [
-                    { "multi_match": {
-                        "query": shaped,
-                        "fields": ["name^4", "code^2", "body", "defs^3", "title"],
-                        "type": "most_fields"
-                    }},
-                    { "match_phrase": { "defs": { "query": shaped, "boost": 8 } } },
-                    { "term": { "name": { "value": q.trim(), "boost": 10 } } }
-                ]}}),
-            );
+            let mut should = vec![
+                json!({ "multi_match": {
+                    "query": shaped,
+                    "fields": ["name^4", "code^2", "body", "defs^3", "title"],
+                    "type": "most_fields"
+                }}),
+                json!({ "match_phrase": { "defs": { "query": shaped, "boost": 8 } } }),
+                json!({ "term": { "name": { "value": q.trim(), "boost": 10 } } }),
+            ];
+            // Same exact-phrase leg as `xerj search`: a pasted error string
+            // must rank the file that contains it, not a `defs` list that
+            // shares two of its words.
+            if let Some(phrase) = xerj_common::code_query::exact_phrase_query(q) {
+                should.push(json!({ "match_phrase": { "body": {
+                    "query": phrase,
+                    "boost": xerj_common::code_query::EXACT_PHRASE_BOOST
+                } } }));
+            }
+            body.insert("query".into(), json!({ "bool": { "should": should } }));
         }
         Some(q) if !q.is_null() => {
             body.insert("query".into(), q.clone());
